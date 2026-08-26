@@ -1,0 +1,10 @@
+# udap:meta cloud=aws region=us-east-1 target=ec2
+
+user: User { udap-type: generic.user }
+vpc: VPC {
+  web: Django Server (nginx + gunicorn) { udap-type: aws.ec2 }
+  db: SQLite (on-instance) { udap-type: generic.db }
+}
+
+user -> vpc.web: HTTPS 80/443
+vpc.web -> vpc.db: reads/writes

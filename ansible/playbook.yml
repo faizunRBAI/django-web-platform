@@ -1,0 +1,172 @@
+---
+- name: Configure Django application server
+  hosts: all
+  become: true
+
+  vars:
+    app_dir: /opt/app
+    app_port: 8000
+    # Passed in by the configure stage: -e "django_secret_key=..."
+    django_secret_key: ""
+
+  tasks:
+    - name: Wait for SSH to be ready
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Fail fast when the Django secret was not supplied
+      ansible.builtin.assert:
+        that:
+          - django_secret_key | length > 0
+        fail_msg: >-
+          django_secret_key is empty. The configure stage must pass it from the
+          DJANGO_SECRET_KEY pipeline secret.
+
+    # No cache_valid_time: a freshly provisioned cloud image ships a stale index
+    # that resolves to superseded package versions (apt 404s on install).
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      register: apt_update
+      retries: 5
+      delay: 15
+      until: apt_update is succeeded
+
+    - name: Install runtime packages
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - python3-pip
+          - nginx
+        state: present
+      register: apt_install
+      retries: 5
+      delay: 15
+      until: apt_install is succeeded
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy application source
+      ansible.builtin.copy:
+        src: "../{{ item }}"
+        dest: "{{ app_dir }}/"
+        mode: "0644"
+      loop:
+        - project
+        - core
+        - manage.py
+        - requirements.txt
+      notify: Restart application
+
+    - name: Write application environment file
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ app_dir }}/.env"
+        mode: "0600"
+      no_log: true
+      notify: Restart application
+
+    - name: Create virtualenv
+      ansible.builtin.command:
+        cmd: python3 -m venv {{ app_dir }}/venv
+        creates: "{{ app_dir }}/venv/bin/python"
+
+    - name: Install Python dependencies into the venv
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+      notify: Restart application
+
+    - name: Run database migrations
+      ansible.builtin.command:
+        cmd: "{{ app_dir }}/venv/bin/python {{ app_dir }}/manage.py migrate --noinput"
+      environment:
+        DJANGO_SECRET_KEY: "{{ django_secret_key }}"
+        DJANGO_DB_PATH: "{{ app_dir }}/db.sqlite3"
+      register: migrate_result
+      changed_when: "'No migrations to apply' not in migrate_result.stdout"
+
+    - name: Collect static files
+      ansible.builtin.command:
+        cmd: "{{ app_dir }}/venv/bin/python {{ app_dir }}/manage.py collectstatic --noinput"
+      environment:
+        DJANGO_SECRET_KEY: "{{ django_secret_key }}"
+      register: collectstatic_result
+      changed_when: "'0 static files copied' not in collectstatic_result.stdout"
+
+    # migrate runs as root and creates db.sqlite3 root-owned; gunicorn runs as
+    # www-data and SQLite needs write access to BOTH the file and its directory
+    # (for the -journal/-wal sidecar files). This must come AFTER migrate.
+    - name: Ensure the application tree is owned by the service user
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        recurse: true
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: app.service.j2
+        dest: /etc/systemd/system/app.service
+        mode: "0644"
+      notify: Restart application
+
+    - name: Install nginx site
+      ansible.builtin.template:
+        src: nginx-site.j2
+        dest: /etc/nginx/sites-available/default
+        mode: "0644"
+      notify: Reload nginx
+
+    - name: Check the nginx configuration is valid
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+
+    - name: Enable and start the application
+      ansible.builtin.systemd:
+        name: app
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Apply pending restarts before health checking
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the application port to accept connections
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 90
+
+    - name: Verify the health endpoint through nginx
+      ansible.builtin.uri:
+        url: "http://127.0.0.1/health"
+        status_code: 200
+      register: health_check
+      retries: 10
+      delay: 6
+      until: health_check is succeeded
+
+  handlers:
+    - name: Restart application
+      ansible.builtin.systemd:
+        name: app
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
